@@ -1,5 +1,5 @@
 ### nonebot_plugin_emby_webhook
-emby更新推送  
+AI写的emby更新推送  
 食用方式  
 
 将 nonebot_plugin_emby_webhook 放置 src\plugins 下，修改 webhook.py 中的第 37 行 为你的emby地址，默认为http://127.0.0.1:8096，启动nonebot  
