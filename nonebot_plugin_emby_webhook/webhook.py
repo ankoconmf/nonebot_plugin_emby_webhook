@@ -4,6 +4,7 @@ from fastapi import Request
 from nonebot import get_app
 import json
 import os
+import logging
 
 app = get_app()
 driver = get_driver()
@@ -12,7 +13,7 @@ SUBSCRIBE_FILE = "emby_subscribe.json"
 
 def load_subscribe():
     if not os.path.exists(SUBSCRIBE_FILE):
-        return []
+        return {}
     with open(SUBSCRIBE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -20,39 +21,62 @@ def load_subscribe():
 async def emby_webhook(request: Request):
     try:
         data = await request.json()
+        logging.info(f"收到 webhook 数据: {data}")
+        name = data.get("name")
+        subscribe_dict = load_subscribe()
+
+        # 如果没有 name 字段，尝试用 Server.Name 匹配
+        if not name:
+            server = data.get("Server", {})
+            server_name = server.get("Name")
+            if not server_name:
+                return {"error": "缺少 emby 名称参数，也没有 Server.Name"}
+            name = server_name
+
+        emby_info = subscribe_dict.get(name)
+        if not emby_info:
+            return {"error": f"Emby 名称 {name} 不存在"}
+        emby_host = emby_info["url"]
+        group_ids = emby_info["groups"]
+
+        # 组装消息（示例，实际可根据你的需求调整）
+        title = data.get("Title", "未知通知")
+        description = data.get("Description", "")
         item = data.get("Item", {})
+        image_url = ""
         item_id = item.get("Id")
         image_tags = item.get("ImageTags", {})
-
-        # 提取所需字段
-        series_name = item.get("SeriesName", "未知剧集")
-        episode_number = item.get("IndexNumber", 0)
-        episode_name = item.get("Name", "未知标题")
-        runtime_ticks = item.get("RunTimeTicks", 0)
-
-        # 将 ticks 转为分钟（1 tick = 10000 毫秒）
-        runtime_minutes = int(runtime_ticks / 10_000_000 / 60)
-
-        # 生成封面图地址
-        emby_host = "http://127.0.0.1:8096"  # ← 改为你的 Emby 地址
-        image_url = ""
         if "Primary" in image_tags and item_id:
             image_url = f"{emby_host}/Items/{item_id}/Images/Primary?maxWidth=640"
+        if not image_url:
+            series_id = item.get("SeriesId")
+            series_image_tags = item.get("SeriesImageTags", {})
+            if series_id and "Primary" in series_image_tags:
+                image_url = f"{emby_host}/Items/{series_id}/Images/Primary?maxWidth=640"
 
         # 组装消息
-        msg = (
-            f"🎞️ 《{series_name}》更新啦\n"
-            f"📌 第{episode_number}集：{episode_name}\n"
-            f"⏱️ 时长：{runtime_minutes} 分钟\n"
-        )
+        series_name = item.get("SeriesName", title)
+        episode_number = item.get("IndexNumber", "")
+        episode_title = item.get("Name", "")
+        runtime_ticks = item.get("RunTimeTicks", 0)
+        runtime_minutes = int(runtime_ticks / 10_000_000 / 60) if runtime_ticks else ""
+        overview = item.get("Overview", "")
+
+        msg = f"Emby服务器：{name}\n"
+        msg += f"🎞️ 《{series_name}》更新啦\n"
+        msg += f"📌 第{episode_number}集：{episode_title}\n"
+        msg += f"⏱️ 时长：{runtime_minutes}分钟\n"
+        msg += f"{overview}\n"
         if image_url:
-            msg += f"\n[CQ:image,file={image_url}]"
+            msg += f"[CQ:image,file={image_url}]"
 
         bot: Bot = list(driver.bots.values())[0]
-        group_ids = load_subscribe()
-
         for group_id in group_ids:
-            await bot.send_group_msg(group_id=group_id, message=msg)
+            try:
+                await bot.send_group_msg(group_id=group_id, message=msg)
+                logging.info(f"已推送到群 {group_id}")
+            except Exception as e:
+                logging.error(f"推送到群 {group_id} 失败: {e}")
 
         return {"status": "ok", "groups": group_ids}
     except Exception as e:
