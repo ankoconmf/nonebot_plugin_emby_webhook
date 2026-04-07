@@ -5,17 +5,38 @@ from nonebot import get_app
 import json
 import os
 import logging
+import hashlib
 
 app = get_app()
 driver = get_driver()
 
 SUBSCRIBE_FILE = "emby_subscribe.json"
+LAST_MESSAGE_FILE = "emby_last_message.json"
 
 def load_subscribe():
     if not os.path.exists(SUBSCRIBE_FILE):
         return {}
     with open(SUBSCRIBE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
+
+def load_last_message():
+    """加载最后推送的消息记录"""
+    if not os.path.exists(LAST_MESSAGE_FILE):
+        return {}
+    try:
+        with open(LAST_MESSAGE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_last_message(last_messages):
+    """保存最后推送的消息记录"""
+    with open(LAST_MESSAGE_FILE, "w", encoding="utf-8") as f:
+        json.dump(last_messages, f, ensure_ascii=False, indent=2)
+
+def get_message_hash(message):
+    """计算消息的哈希值"""
+    return hashlib.md5(message.encode("utf-8")).hexdigest()
 
 @app.post("/emby/webhook")
 async def emby_webhook(request: Request):
@@ -69,6 +90,19 @@ async def emby_webhook(request: Request):
         msg += f"{overview}\n"
         if image_url:
             msg += f"[CQ:image,file={image_url}]"
+
+        # 检查消息是否与上次相同
+        last_messages = load_last_message()
+        current_msg_hash = get_message_hash(msg)
+        
+        last_msg_hash = last_messages.get(name)
+        if last_msg_hash == current_msg_hash:
+            logging.info(f"消息与上次相同，跳过推送")
+            return {"status": "skipped", "reason": "消息重复", "groups": group_ids}
+        
+        # 更新最后推送的消息记录
+        last_messages[name] = current_msg_hash
+        save_last_message(last_messages)
 
         bot: Bot = list(driver.bots.values())[0]
         for group_id in group_ids:
