@@ -49,7 +49,7 @@ AI写的emby和jellyfin更新推送
    - **订阅jellyfin** `服务器名称`
    - **取消订阅jellyfin** `服务器名称`
    - **删除jellyfin** `服务器名称`
-5. （可选）点击 **Send Test Notification** 测试通知是否正常工作
+
 
 ## 特性
 
