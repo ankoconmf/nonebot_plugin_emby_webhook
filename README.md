@@ -78,3 +78,4 @@ AI写的emby和jellyfin更新推送
   }
 }
 ```
+<img width="1415" height="847" alt="QQ_1778954443408" src="https://github.com/user-attachments/assets/e3f92639-39de-4b63-a9fc-6ed61fe0c8c8" />
