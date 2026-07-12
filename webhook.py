@@ -7,6 +7,7 @@ import os
 import hashlib
 from html import unescape
 import html
+from urllib.parse import quote
 import httpx
 
 app = get_app()
@@ -120,6 +121,76 @@ async def image_exists(url):
             f"检查图片存在性失败: {url}"
         )
         return False
+
+
+async def fetch_bangumi_image(keyword):
+    """Emby 无海报时，用番剧名去 Bangumi 搜索封面（无需 API key）"""
+    if not keyword:
+        return ""
+
+    search_url = (
+        "https://api.bgm.tv/search/subject/"
+        f"{quote(keyword)}?type=2&responseGroup=small&max_results=1"
+    )
+
+    headers = {
+        # Bangumi 要求带 User-Agent，否则可能被拒
+        "User-Agent": (
+            "nonebot-plugin-emby-webhook "
+            "(https://github.com/ankoconmf/nonebot_plugin_emby_webhook)"
+        )
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                search_url,
+                headers=headers,
+                follow_redirects=True,
+            )
+
+            if resp.status_code != 200:
+                logger.info(
+                    f"Bangumi 搜索无结果: {keyword} "
+                    f"(status={resp.status_code})"
+                )
+                return ""
+
+            result = resp.json()
+
+            items = result.get("list") or []
+
+            if not items:
+                logger.info(f"Bangumi 未找到条目: {keyword}")
+                return ""
+
+            top = items[0]
+
+            images = top.get("images") or {}
+
+            image_url = (
+                images.get("large")
+                or images.get("common")
+                or images.get("medium")
+                or ""
+            )
+
+            # bgm 返回的图片链接是 http，换成 https 更兼容
+            if image_url.startswith("http://"):
+                image_url = "https://" + image_url[len("http://"):]
+
+            if image_url:
+                logger.info(
+                    f"Bangumi 匹配到《{top.get('name_cn') or top.get('name')}》"
+                    f" 封面: {image_url}"
+                )
+
+            return image_url
+    except Exception:
+        logger.opt(exception=True).warning(
+            f"Bangumi 搜索封面失败: {keyword}"
+        )
+        return ""
 
 
 async def send_notification(msg, name, subscribe_dict):
@@ -279,6 +350,17 @@ async def emby_webhook(request: Request):
 
         # 类型：Movie（剧场版/电影）或 Episode（剧集）
         item_type = item.get("Type", "")
+
+        # Emby 都拿不到图时，最后用番剧名去 Bangumi 搜封面兜底
+        if not image_url:
+            if item_type == "Movie":
+                bangumi_keyword = item.get("Name", "")
+            else:
+                bangumi_keyword = item.get("SeriesName", "")
+
+            bangumi_keyword = html.unescape(bangumi_keyword)
+
+            image_url = await fetch_bangumi_image(bangumi_keyword)
 
         item_name = html.unescape(
             item.get("Name", "")
