@@ -7,6 +7,7 @@ import os
 import hashlib
 from html import unescape
 import html
+import httpx
 
 app = get_app()
 driver = get_driver()
@@ -94,6 +95,31 @@ def parse_runtime(runtime_ticks):
         return f"{runtime_minutes}分钟"
     except Exception:
         return ""
+
+
+async def image_exists(url):
+    """检查图片 URL 是否真实存在（避免推送 404 坏图）"""
+    try:
+        async with httpx.AsyncClient(
+            timeout=5,
+            verify=False,
+        ) as client:
+            resp = await client.get(
+                url,
+                follow_redirects=True,
+            )
+
+            content_type = resp.headers.get("Content-Type", "")
+
+            return (
+                resp.status_code == 200
+                and content_type.startswith("image/")
+            )
+    except Exception:
+        logger.opt(exception=True).warning(
+            f"检查图片存在性失败: {url}"
+        )
+        return False
 
 
 async def send_notification(msg, name, subscribe_dict):
@@ -230,19 +256,22 @@ async def emby_webhook(request: Request):
                 f"?maxWidth=640"
             )
 
+        # 单集没图时，兜底用剧集海报
         if not image_url:
             series_id = item.get("SeriesId")
 
-            series_image_tags = item.get(
-                "SeriesImageTags",
-                {},
-            )
-
-            if series_id and "Primary" in series_image_tags:
-                image_url = (
+            if series_id:
+                series_image_url = (
                     f"{emby_host}/Items/{series_id}/Images/Primary"
                     f"?maxWidth=640"
                 )
+
+                if await image_exists(series_image_url):
+                    image_url = series_image_url
+                else:
+                    logger.info(
+                        f"剧集 {series_id} 没有可用海报，跳过图片"
+                    )
 
         # 类型：Movie（剧场版/电影）或 Episode（剧集）
         item_type = item.get("Type", "")
