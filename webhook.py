@@ -244,18 +244,16 @@ async def emby_webhook(request: Request):
                     f"?maxWidth=640"
                 )
 
-        # 文本
-        series_name = html.unescape(
-            item.get("SeriesName", title)
-        )
+        # 类型：Movie（剧场版/电影）或 Episode（剧集）
+        item_type = item.get("Type", "")
 
-        episode_number = item.get("IndexNumber", "?")
-
-        episode_title = html.unescape(
+        item_name = html.unescape(
             item.get("Name", "")
         )
 
-        season_number = item.get("ParentIndexNumber", "")
+        original_title = html.unescape(
+            item.get("OriginalTitle", "")
+        )
 
         runtime_ticks = item.get(
             "RunTimeTicks",
@@ -271,12 +269,35 @@ async def emby_webhook(request: Request):
         overview = overview[:300]
 
         # 组装
-        msg = f"Emby服务器：{name}\n"
-        msg += f"🎞️ 《{series_name}》更新啦\n"
-        if season_number:
-            msg += f"📌 第{season_number}季 第{episode_number}集：{episode_title}\n"
+        if item_type == "Movie":
+            # 剧场版/电影
+            movie_name = item_name or title
+            msg = f"Emby服务器：{name}\n"
+            msg += f"🎬 剧场版《{movie_name}》更新啦\n"
+            if original_title and original_title != movie_name:
+                msg += f"📀 原名：{original_title}\n"
+
+            year = item.get("ProductionYear", "")
+            if year:
+                msg += f"📅 年份：{year}\n"
         else:
-            msg += f"📌 第{episode_number}集：{episode_title}\n"
+            # 剧集
+            series_name = html.unescape(
+                item.get("SeriesName", title)
+            )
+
+            episode_number = item.get("IndexNumber", "?")
+
+            episode_title = item_name
+
+            season_number = item.get("ParentIndexNumber", "")
+
+            msg = f"Emby服务器：{name}\n"
+            msg += f"🎞️ 《{series_name}》更新啦\n"
+            if season_number:
+                msg += f"📌 第{season_number}季 第{episode_number}集：{episode_title}\n"
+            else:
+                msg += f"📌 第{episode_number}集：{episode_title}\n"
 
         if runtime_str:
             msg += f"⏱️ 时长：{runtime_str}\n"
