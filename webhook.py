@@ -266,7 +266,11 @@ async def emby_webhook(request: Request):
                     f"?maxWidth=640"
                 )
 
-                if await image_exists(series_image_url):
+                # webhook 已带 SeriesPrimaryImageTag 时说明剧集海报存在，
+                # 直接使用，避免多余的 HTTP 请求（网络失败会误判为没图）
+                if item.get("SeriesPrimaryImageTag"):
+                    image_url = series_image_url
+                elif await image_exists(series_image_url):
                     image_url = series_image_url
                 else:
                     logger.info(
