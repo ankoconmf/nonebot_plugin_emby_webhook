@@ -99,6 +99,39 @@ def parse_runtime(runtime_ticks):
         return ""
 
 
+# 简介字符上限。QQ 单条消息长度有限，超过这里按句子截断并补省略号；
+# 想完整显示就把数字调大（Emby/TMDB 的长简介通常几百字）。
+OVERVIEW_MAX_LENGTH = 1000
+
+_SENTENCE_ENDS = "。！？!?….；;"
+
+
+def format_overview(text, max_length=OVERVIEW_MAX_LENGTH):
+    """整理简介：成段的连续空白还原成换行，超长时按句子截断并加省略号"""
+    text = (text or "").strip()
+
+    if not text:
+        return ""
+
+    # Emby/TMDB 的简介用连续空格或换行分段，原样发出去会糊成一整段
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
+    text = re.sub(r"[ \t]{2,}", "\n", text)
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+
+    if len(text) <= max_length:
+        return text
+
+    clipped = text[:max_length]
+
+    # 尽量截在句子结尾，避免停在半个句子上
+    cut = max(clipped.rfind(char) for char in _SENTENCE_ENDS)
+
+    if cut > max_length // 2:
+        clipped = clipped[:cut + 1]
+
+    return f"{clipped.rstrip()}……"
+
+
 def make_async_client(**kwargs):
     """构造 httpx 异步客户端。
 
@@ -648,11 +681,9 @@ async def emby_webhook(request: Request):
 
         runtime_str = parse_runtime(runtime_ticks)
 
-        overview = html.unescape(
-            item.get("Overview", "")
+        overview = format_overview(
+            html.unescape(item.get("Overview", ""))
         )
-
-        overview = overview[:300]
 
         # Bangumi：查一次拿评分，Emby 没有海报时顺带用它兜底封面
         if item_type == "Movie":
@@ -823,11 +854,9 @@ async def jellyfin_webhook(request: Request):
 
         runtime_str = parse_runtime(runtime_ticks)
 
-        overview = html.unescape(
-            data.get("Overview", "")
+        overview = format_overview(
+            html.unescape(data.get("Overview", ""))
         )
-
-        overview = overview[:300]
 
         # 图片
         item_id = data.get("ItemId")
