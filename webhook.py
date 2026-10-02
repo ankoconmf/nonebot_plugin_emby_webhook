@@ -5,6 +5,7 @@ from nonebot import get_app
 import json
 import os
 import hashlib
+import re
 from html import unescape
 import html
 from urllib.parse import quote
@@ -98,10 +99,26 @@ def parse_runtime(runtime_ticks):
         return ""
 
 
+def make_async_client(**kwargs):
+    """构造 httpx 异步客户端。
+
+    环境变量 no_proxy 里含 [::1] 这类带方括号的条目时，httpx 解析环境代理
+    会在构造阶段直接抛 InvalidURL，导致请求全都拿不到结果。这种情况退化为
+    直连，并在日志里说明。
+    """
+    try:
+        return httpx.AsyncClient(**kwargs)
+    except Exception as e:
+        logger.warning(
+            f"读取系统代理配置失败（{e}），本次改用直连（忽略环境代理）"
+        )
+        return httpx.AsyncClient(trust_env=False, **kwargs)
+
+
 async def image_exists(url):
     """检查图片 URL 是否真实存在（避免推送 404 坏图）"""
     try:
-        async with httpx.AsyncClient(
+        async with make_async_client(
             timeout=5,
             verify=False,
         ) as client:
@@ -123,29 +140,224 @@ async def image_exists(url):
         return False
 
 
-async def fetch_bangumi_image(keyword):
-    """Emby 无海报时，用番剧名去 Bangumi 搜索封面（无需 API key）"""
-    if not keyword:
+# Bangumi 接口与请求头（Bangumi 要求带 User-Agent，否则可能被拒）
+BANGUMI_API = "https://api.bgm.tv"
+BANGUMI_HEADERS = {
+    "User-Agent": (
+        "nonebot-plugin-emby-webhook "
+        "(https://github.com/ankoconmf/nonebot_plugin_emby_webhook)"
+    )
+}
+
+# 按“剧名 + 季号”缓存查询结果，同一部番反复推送时不再重复请求
+_bangumi_cache = {}
+
+# 找不到对应季度条目时，退回用系列主条目（通常就是第一季）的评分，
+# 并在消息里标注「第一季」以免和当季分数混淆。关掉则改为不显示评分行。
+BANGUMI_FALLBACK_TO_SERIES = True
+
+_CN_NUMBERS = "零一二三四五六七八九"
+_CN_DIGITS = {char: index for index, char in enumerate(_CN_NUMBERS) if index}
+
+
+def to_chinese_number(number):
+    """1-99 转中文数字，用于拼「第三季」这类搜索词"""
+    if not isinstance(number, int) or number < 1 or number > 99:
         return ""
 
+    if number < 10:
+        return _CN_NUMBERS[number]
+
+    tens, ones = divmod(number, 10)
+    text = "十" if tens == 1 else f"{_CN_NUMBERS[tens]}十"
+
+    return text if ones == 0 else f"{text}{_CN_NUMBERS[ones]}"
+
+
+def chinese_to_int(text):
+    """「三」「十二」「二十一」转成整数，解析失败返回 None"""
+    text = (text or "").strip()
+
+    if not text:
+        return None
+
+    if "十" not in text:
+        return _CN_DIGITS.get(text)
+
+    left, _, right = text.partition("十")
+
+    if (left and left not in _CN_DIGITS) or (right and right not in _CN_DIGITS):
+        return None
+
+    tens = _CN_DIGITS[left] if left else 1
+    ones = _CN_DIGITS[right] if right else 0
+
+    return tens * 10 + ones
+
+
+def parse_season_number(*values):
+    """从季号字段或「第 3 季」这类文本里取季号，取不到返回 None"""
+    for value in values:
+        if value is None or isinstance(value, bool):
+            continue
+
+        if isinstance(value, int):
+            if value > 0:
+                return value
+            continue
+
+        text = str(value).strip()
+
+        if not text:
+            continue
+
+        digits = re.search(r"\d+", text)
+
+        if digits:
+            number = int(digits.group())
+            if number > 0:
+                return number
+            continue
+
+        chinese = re.search(r"[一二三四五六七八九十]+", text)
+
+        if chinese:
+            number = chinese_to_int(chinese.group())
+            if number:
+                return number
+
+    return None
+
+
+def ordinal(number):
+    """3 -> 3rd，用于匹配「3rd Season」"""
+    if 10 <= number % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
+
+    return f"{number}{suffix}"
+
+
+def season_matches(text, season):
+    """条目名里是否标了指定季号（第3季 / 第3期 / 第三季 / Season 3 / 3rd Season）"""
+    if not text or not season or season < 2:
+        return False
+
+    normalized = re.sub(r"\s+", "", str(text)).lower()
+
+    markers = [
+        f"第{season}季",
+        f"第{season}期",
+        f"第{season}部",
+        f"season{season}",
+        f"{ordinal(season)}season",
+    ]
+
+    chinese = to_chinese_number(season)
+
+    if chinese:
+        markers += [
+            f"第{chinese}季",
+            f"第{chinese}期",
+            f"第{chinese}部",
+        ]
+
+    return any(marker in normalized for marker in markers)
+
+
+def build_bangumi_keywords(keyword, season):
+    """按优先级给出候选搜索词，季度大于 1 时把季号并进去"""
+    keywords = []
+
+    if season and season > 1:
+        keywords.append(f"{keyword} 第{season}季")
+
+        chinese = to_chinese_number(season)
+
+        if chinese:
+            keywords.append(f"{keyword} 第{chinese}季")
+
+        keywords.append(f"{keyword} Season {season}")
+
+    keywords.append(keyword)
+
+    return keywords
+
+
+async def fetch_bangumi_info(keyword, season=None):
+    """用番剧名去 Bangumi 搜索条目（无需 API key），返回封面与评分。
+
+    带季号时优先找对应季度的条目并校验条目名里的季号，避免整部作品的第 2、
+    3 季都拿到第一季（主条目）的评分；找不到当季条目时按 BANGUMI_FALLBACK_TO_SERIES
+    退回主条目评分并标注，关掉开关则不显示评分。
+    """
+    keyword = (keyword or "").strip()
+
+    if not keyword:
+        return {}
+
+    season = season if season and season > 1 else None
+
+    cache_key = (keyword, season)
+
+    if cache_key in _bangumi_cache:
+        return _bangumi_cache[cache_key]
+
+    series_info = {}
+
+    for candidate in build_bangumi_keywords(keyword, season):
+        info = await _request_bangumi_info(candidate)
+
+        if not info:
+            continue
+
+        if not season:
+            # 单片（电影）或第一季：主条目就是它本身
+            _bangumi_cache[cache_key] = info
+            return info
+
+        entry_name = f"{info.get('name') or ''} {info.get('name_original') or ''}"
+
+        if season_matches(entry_name, season):
+            _bangumi_cache[cache_key] = info
+            return info
+
+        # 不带季号的候选命中的是系列主条目，留作兜底
+        if candidate == keyword:
+            series_info = info
+
+    if season and series_info and BANGUMI_FALLBACK_TO_SERIES:
+        series_info["first_season_fallback"] = True
+        _bangumi_cache[cache_key] = series_info
+
+        logger.info(
+            f"Bangumi 没有第{season}季的条目，退回主条目"
+            f"《{series_info.get('name')}》的评分: {keyword}"
+        )
+
+        return series_info
+
+    # 只在有结果时缓存，避免网络临时故障或新番未建条目被长期记住
+    if season:
+        logger.info(
+            f"Bangumi 没有第{season}季的条目，本条推送不显示评分: {keyword}"
+        )
+
+    return {}
+
+
+async def _request_bangumi_info(keyword):
     search_url = (
-        "https://api.bgm.tv/search/subject/"
+        f"{BANGUMI_API}/search/subject/"
         f"{quote(keyword)}?type=2&responseGroup=small&max_results=1"
     )
 
-    headers = {
-        # Bangumi 要求带 User-Agent，否则可能被拒
-        "User-Agent": (
-            "nonebot-plugin-emby-webhook "
-            "(https://github.com/ankoconmf/nonebot_plugin_emby_webhook)"
-        )
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
+        async with make_async_client(timeout=5) as client:
             resp = await client.get(
                 search_url,
-                headers=headers,
+                headers=BANGUMI_HEADERS,
                 follow_redirects=True,
             )
 
@@ -154,15 +366,13 @@ async def fetch_bangumi_image(keyword):
                     f"Bangumi 搜索无结果: {keyword} "
                     f"(status={resp.status_code})"
                 )
-                return ""
+                return {}
 
-            result = resp.json()
-
-            items = result.get("list") or []
+            items = (resp.json().get("list")) or []
 
             if not items:
                 logger.info(f"Bangumi 未找到条目: {keyword}")
-                return ""
+                return {}
 
             top = items[0]
 
@@ -179,18 +389,90 @@ async def fetch_bangumi_image(keyword):
             if image_url.startswith("http://"):
                 image_url = "https://" + image_url[len("http://"):]
 
-            if image_url:
-                logger.info(
-                    f"Bangumi 匹配到《{top.get('name_cn') or top.get('name')}》"
-                    f" 封面: {image_url}"
-                )
+            name = top.get("name_cn") or top.get("name") or ""
 
-            return image_url
+            # 评分只在新版 v0 详情接口里，search 接口不返回
+            score, votes = await _fetch_bangumi_rating(
+                client, top.get("id")
+            )
+
+            logger.info(
+                f"Bangumi 命中搜索「{keyword}」→《{name}》"
+                f" 封面: {image_url or '无'}"
+                f" 评分: {score if score else '无'}"
+            )
+
+            return {
+                "id": top.get("id"),
+                "name": name,
+                "name_original": top.get("name") or "",
+                "image": image_url,
+                "score": score,
+                "votes": votes,
+            }
     except Exception:
         logger.opt(exception=True).warning(
-            f"Bangumi 搜索封面失败: {keyword}"
+            f"Bangumi 搜索失败: {keyword}"
         )
+        return {}
+
+
+async def _fetch_bangumi_rating(client, subject_id):
+    """从 Bangumi v0 详情接口取评分，返回 (评分, 评分人数)"""
+    if not subject_id:
+        return None, 0
+
+    try:
+        resp = await client.get(
+            f"{BANGUMI_API}/v0/subjects/{subject_id}",
+            headers=BANGUMI_HEADERS,
+            follow_redirects=True,
+        )
+
+        if resp.status_code != 200:
+            logger.info(
+                f"Bangumi 详情获取失败: {subject_id} "
+                f"(status={resp.status_code})"
+            )
+            return None, 0
+
+        rating = resp.json().get("rating") or {}
+
+        score = rating.get("score")
+        votes = rating.get("total") or 0
+
+        if not score:
+            return None, 0
+
+        return round(float(score), 1), int(votes)
+    except Exception:
+        logger.opt(exception=True).warning(
+            f"Bangumi 评分获取失败: {subject_id}"
+        )
+        return None, 0
+
+
+def format_bangumi_score(info):
+    """把 Bangumi 评分格式化成消息行，没有评分时返回空串"""
+    info = info or {}
+
+    score = info.get("score")
+
+    if not score:
         return ""
+
+    votes = info.get("votes") or 0
+
+    detail = f"{votes}人评分" if votes else ""
+
+    # 退回到主条目（第一季）时标注出来，避免误当成当季评分
+    if info.get("first_season_fallback"):
+        detail = f"{detail}·第一季" if detail else "第一季"
+
+    if detail:
+        return f"⭐ Bangumi评分：{score}分（{detail}）"
+
+    return f"⭐ Bangumi评分：{score}分"
 
 
 async def send_notification(msg, name, subscribe_dict):
@@ -351,17 +633,6 @@ async def emby_webhook(request: Request):
         # 类型：Movie（剧场版/电影）或 Episode（剧集）
         item_type = item.get("Type", "")
 
-        # Emby 都拿不到图时，最后用番剧名去 Bangumi 搜封面兜底
-        if not image_url:
-            if item_type == "Movie":
-                bangumi_keyword = item.get("Name", "")
-            else:
-                bangumi_keyword = item.get("SeriesName", "")
-
-            bangumi_keyword = html.unescape(bangumi_keyword)
-
-            image_url = await fetch_bangumi_image(bangumi_keyword)
-
         item_name = html.unescape(
             item.get("Name", "")
         )
@@ -382,6 +653,30 @@ async def emby_webhook(request: Request):
         )
 
         overview = overview[:300]
+
+        # Bangumi：查一次拿评分，Emby 没有海报时顺带用它兜底封面
+        if item_type == "Movie":
+            bangumi_keyword = item_name
+            bangumi_season = None
+        else:
+            bangumi_keyword = html.unescape(
+                item.get("SeriesName", "")
+            )
+            # 第 3 季要查第 3 季的条目，只给剧名会命中第一季（主条目）
+            bangumi_season = parse_season_number(
+                item.get("ParentIndexNumber"),
+                item.get("SeasonName"),
+            )
+
+        bangumi_info = await fetch_bangumi_info(
+            bangumi_keyword,
+            bangumi_season,
+        )
+
+        if not image_url:
+            image_url = bangumi_info.get("image", "")
+
+        bangumi_line = format_bangumi_score(bangumi_info)
 
         # 组装
         if item_type == "Movie":
@@ -418,6 +713,9 @@ async def emby_webhook(request: Request):
                 msg += f"📌 {season_name} 第{episode_number}集：{episode_title}\n"
             else:
                 msg += f"📌 第{episode_number}集：{episode_title}\n"
+
+        if bangumi_line:
+            msg += f"{bangumi_line}\n"
 
         if runtime_str:
             msg += f"⏱️ 时长：{runtime_str}\n"
@@ -542,10 +840,35 @@ async def jellyfin_webhook(request: Request):
                 f"?maxWidth=640"
             )
 
+        # Bangumi：查一次拿评分，Jellyfin 没有 ItemId 时顺带兜底封面
+        if item_type == "Movie":
+            bangumi_keyword = item_name
+            bangumi_season = None
+        else:
+            bangumi_keyword = series_name
+            # 第 3 季要查第 3 季的条目，只给剧名会命中第一季（主条目）
+            bangumi_season = parse_season_number(
+                data.get("SeasonNumber00"),
+                data.get("SeasonNumber"),
+            )
+
+        bangumi_info = await fetch_bangumi_info(
+            bangumi_keyword,
+            bangumi_season,
+        )
+
+        if not image_url:
+            image_url = bangumi_info.get("image", "")
+
+        bangumi_line = format_bangumi_score(bangumi_info)
+
         # 组装消息
         msg = f"Jellyfin服务器：{name}\n"
         msg += f"🎬 《{series_name}》更新啦\n"
         msg += f"📌 {title}\n"
+
+        if bangumi_line:
+            msg += f"{bangumi_line}\n"
 
         if runtime_str:
             msg += f"⏱️ 时长：{runtime_str}\n"
