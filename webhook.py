@@ -405,12 +405,17 @@ async def emby_webhook(request: Request):
 
             episode_title = item_name
 
-            season_number = item.get("ParentIndexNumber", "")
+            season_number = item.get("ParentIndexNumber")
+
+            # 特别篇/OVA 的季号为 0（falsy），此时用 SeasonName（如「特别篇」）
+            season_name = html.unescape(item.get("SeasonName", ""))
 
             msg = f"Emby服务器：{name}\n"
             msg += f"🎞️ 《{series_name}》更新啦\n"
             if season_number:
                 msg += f"📌 第{season_number}季 第{episode_number}集：{episode_title}\n"
+            elif season_name:
+                msg += f"📌 {season_name} 第{episode_number}集：{episode_title}\n"
             else:
                 msg += f"📌 第{episode_number}集：{episode_title}\n"
 
