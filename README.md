@@ -51,6 +51,13 @@ AI写的emby和jellyfin更新推送
    - **删除jellyfin订阅**（交互式：回复序号取消本群订阅，服务器配置保留）
 
 
+## 可选配置
+
+写在 `.env` / `.env.prod` 里，和 `HOST`、`PORT` 放在一起：
+
+- `BANGUMI_TOKEN`：Bangumi 个人令牌（在 https://next.bgm.tv/demo/access-token 申请）。
+  配上之后评分走带令牌的 v0 接口，额度和稳定性更好；**没配就走免令牌的接口**，功能一样能用。
+
 ## 特性
 
 - 🔄 支持 Emby 和 Jellyfin 同时运行

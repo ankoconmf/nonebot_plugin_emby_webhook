@@ -6,6 +6,7 @@ import json
 import os
 import hashlib
 import re
+import time
 from html import unescape
 import html
 from urllib.parse import quote
@@ -132,19 +133,36 @@ def format_overview(text, max_length=OVERVIEW_MAX_LENGTH):
     return f"{clipped.rstrip()}……"
 
 
+def log_network_error(message, error):
+    """网络类错误只留一行 warning，完整堆栈降到 debug，避免刷屏"""
+    logger.warning(f"{message}（{type(error).__name__}: {error}）")
+    logger.opt(exception=True).debug(message)
+
+
+# 系统代理配置有问题的警告只打一次，否则每次请求都刷一行
+_proxy_warning_shown = False
+
+
 def make_async_client(**kwargs):
     """构造 httpx 异步客户端。
 
     环境变量 no_proxy 里含 [::1] 这类带方括号的条目时，httpx 解析环境代理
     会在构造阶段直接抛 InvalidURL，导致请求全都拿不到结果。这种情况退化为
-    直连，并在日志里说明。
+    直连，并说明一次。
     """
+    global _proxy_warning_shown
+
     try:
         return httpx.AsyncClient(**kwargs)
     except Exception as e:
-        logger.warning(
-            f"读取系统代理配置失败（{e}），本次改用直连（忽略环境代理）"
-        )
+        message = f"读取系统代理配置失败（{e}），改用直连（忽略环境代理）"
+
+        if _proxy_warning_shown:
+            logger.debug(message)
+        else:
+            _proxy_warning_shown = True
+            logger.warning(message)
+
         return httpx.AsyncClient(trust_env=False, **kwargs)
 
 
@@ -166,10 +184,8 @@ async def image_exists(url):
                 resp.status_code == 200
                 and content_type.startswith("image/")
             )
-    except Exception:
-        logger.opt(exception=True).warning(
-            f"检查图片存在性失败: {url}"
-        )
+    except Exception as e:
+        log_network_error(f"检查图片存在性失败: {url}", e)
         return False
 
 
@@ -181,6 +197,38 @@ BANGUMI_HEADERS = {
         "(https://github.com/ankoconmf/nonebot_plugin_emby_webhook)"
     )
 }
+
+# bgm.tv 的网络时快时慢（实测单次 6~10 秒），超时留足余量
+BANGUMI_TIMEOUT = 12
+
+# 单条推送里查 Bangumi 的总时间上限，超了就放弃后面的候选词
+BANGUMI_LOOKUP_BUDGET = 20
+
+# v0 搜索一次请求就能同时拿到封面与评分；旧版 search 不返回评分
+BANGUMI_SEARCH_V0 = f"{BANGUMI_API}/v0/search/subjects"
+
+# Bangumi 个人令牌从配置读取，不写进代码：
+# 在 .env / .env.prod 里加一行 BANGUMI_TOKEN=你的令牌 即可。
+# 配了令牌就走带令牌的 v0 接口（额度更高），没配就走免令牌的接口。
+_bangumi_token_rejected = False
+
+
+def get_bangumi_token():
+    token = getattr(driver.config, "bangumi_token", "") or ""
+
+    return str(token).strip()
+
+
+def bangumi_headers():
+    """Bangumi 要求带 User-Agent；配了令牌再带上 Authorization"""
+    headers = dict(BANGUMI_HEADERS)
+
+    token = get_bangumi_token()
+
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    return headers
 
 # 按“剧名 + 季号”缓存查询结果，同一部番反复推送时不再重复请求
 _bangumi_cache = {}
@@ -339,8 +387,17 @@ async def fetch_bangumi_info(keyword, season=None):
 
     series_info = {}
 
+    deadline = time.monotonic() + BANGUMI_LOOKUP_BUDGET
+
     for candidate in build_bangumi_keywords(keyword, season):
-        info = await _request_bangumi_info(candidate)
+        if time.monotonic() > deadline:
+            logger.warning(
+                f"Bangumi 查询超过 {BANGUMI_LOOKUP_BUDGET} 秒，"
+                f"放弃剩余候选词: {keyword}"
+            )
+            break
+
+        info = await _request_bangumi_info(candidate, deadline)
 
         if not info:
             continue
@@ -380,14 +437,130 @@ async def fetch_bangumi_info(keyword, season=None):
     return {}
 
 
-async def _request_bangumi_info(keyword):
+def build_bangumi_info(top, score, votes, keyword):
+    """把接口返回的条目整理成统一结构"""
+    images = top.get("images") or {}
+
+    image_url = (
+        images.get("large")
+        or images.get("common")
+        or images.get("medium")
+        or ""
+    )
+
+    # bgm 返回的图片链接是 http，换成 https 更兼容
+    if image_url.startswith("http://"):
+        image_url = "https://" + image_url[len("http://"):]
+
+    name = top.get("name_cn") or top.get("name") or ""
+
+    if score:
+        score = round(float(score), 1)
+        votes = int(votes or 0)
+    else:
+        score, votes = None, 0
+
+    logger.info(
+        f"Bangumi 命中搜索「{keyword}」→《{name}》"
+        f" 封面: {image_url or '无'}"
+        f" 评分: {score if score else '无'}"
+    )
+
+    return {
+        "id": top.get("id"),
+        "name": name,
+        "name_original": top.get("name") or "",
+        "image": image_url,
+        "score": score,
+        "votes": votes,
+    }
+
+
+async def _request_bangumi_info(keyword, deadline=None):
+    """查一个关键词。
+
+    配了令牌就只走带令牌的 v0 接口；没配令牌才用免令牌的接口
+    （先试免令牌的 v0，再退回旧版 search）。
+    """
+    info = await _request_bangumi_info_v0(keyword)
+
+    if info:
+        return info
+
+    # 有令牌就不再动免令牌的旧接口；令牌被拒时例外，否则令牌一过期就没评分了
+    if get_bangumi_token() and not _bangumi_token_rejected:
+        return {}
+
+    # 已经超时就不再走旧接口兜底，避免一条推送卡太久
+    if deadline is not None and time.monotonic() > deadline:
+        logger.warning(
+            f"Bangumi 查询已超过 {BANGUMI_LOOKUP_BUDGET} 秒，"
+            f"跳过旧接口兜底: {keyword}"
+        )
+        return {}
+
+    return await _request_bangumi_info_legacy(keyword)
+
+
+async def _request_bangumi_info_v0(keyword):
+    global _bangumi_token_rejected
+
+    try:
+        async with make_async_client(timeout=BANGUMI_TIMEOUT) as client:
+            resp = await client.post(
+                BANGUMI_SEARCH_V0,
+                params={"limit": 1, "offset": 0},
+                headers=bangumi_headers(),
+                json={"keyword": keyword, "filter": {"type": [2]}},
+                follow_redirects=True,
+            )
+
+            if resp.status_code in (401, 403) and get_bangumi_token():
+                if not _bangumi_token_rejected:
+                    _bangumi_token_rejected = True
+                    logger.warning(
+                        f"Bangumi 令牌被拒（status={resp.status_code}），"
+                        f"请检查 .env 里的 BANGUMI_TOKEN 是否有效；"
+                        f"本次退回免令牌接口"
+                    )
+                return {}
+
+            if resp.status_code != 200:
+                logger.info(
+                    f"Bangumi v0 搜索无结果: {keyword} "
+                    f"(status={resp.status_code})"
+                )
+                return {}
+
+            items = (resp.json().get("data")) or []
+
+            if not items:
+                logger.info(f"Bangumi v0 未找到条目: {keyword}")
+                return {}
+
+            top = items[0]
+            rating = top.get("rating") or {}
+
+            return build_bangumi_info(
+                top,
+                rating.get("score"),
+                rating.get("total"),
+                keyword,
+            )
+    except Exception as e:
+        log_network_error(f"Bangumi v0 搜索失败: {keyword}", e)
+        return {}
+
+
+async def _request_bangumi_info_legacy(keyword):
+    """旧版 search 接口：不返回评分，命中后再请求一次 v0 详情"""
     search_url = (
         f"{BANGUMI_API}/search/subject/"
         f"{quote(keyword)}?type=2&responseGroup=small&max_results=1"
     )
 
     try:
-        async with make_async_client(timeout=5) as client:
+        async with make_async_client(timeout=BANGUMI_TIMEOUT) as client:
             resp = await client.get(
                 search_url,
                 headers=BANGUMI_HEADERS,
@@ -409,44 +582,11 @@ async def _request_bangumi_info(keyword):
 
             top = items[0]
 
-            images = top.get("images") or {}
+            score, votes = await _fetch_bangumi_rating(client, top.get("id"))
 
-            image_url = (
-                images.get("large")
-                or images.get("common")
-                or images.get("medium")
-                or ""
-            )
-
-            # bgm 返回的图片链接是 http，换成 https 更兼容
-            if image_url.startswith("http://"):
-                image_url = "https://" + image_url[len("http://"):]
-
-            name = top.get("name_cn") or top.get("name") or ""
-
-            # 评分只在新版 v0 详情接口里，search 接口不返回
-            score, votes = await _fetch_bangumi_rating(
-                client, top.get("id")
-            )
-
-            logger.info(
-                f"Bangumi 命中搜索「{keyword}」→《{name}》"
-                f" 封面: {image_url or '无'}"
-                f" 评分: {score if score else '无'}"
-            )
-
-            return {
-                "id": top.get("id"),
-                "name": name,
-                "name_original": top.get("name") or "",
-                "image": image_url,
-                "score": score,
-                "votes": votes,
-            }
-    except Exception:
-        logger.opt(exception=True).warning(
-            f"Bangumi 搜索失败: {keyword}"
-        )
+            return build_bangumi_info(top, score, votes, keyword)
+    except Exception as e:
+        log_network_error(f"Bangumi 搜索失败: {keyword}", e)
         return {}
 
 
@@ -478,10 +618,8 @@ async def _fetch_bangumi_rating(client, subject_id):
             return None, 0
 
         return round(float(score), 1), int(votes)
-    except Exception:
-        logger.opt(exception=True).warning(
-            f"Bangumi 评分获取失败: {subject_id}"
-        )
+    except Exception as e:
+        log_network_error(f"Bangumi 评分获取失败: {subject_id}", e)
         return None, 0
 
 
